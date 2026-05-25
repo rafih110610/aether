@@ -1,0 +1,136 @@
+name: Release Public Aether Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (for example v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_path: bin/linux-x86_64/aether
+            bin_name: aether
+          - target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_path: bin/windows-x86_64/aether.exe
+            bin_name: aether.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Ensure binary exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ matrix.bin_path }}"
+
+      - name: Prepare artifact dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE_DIR="dist/aether-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE_DIR"
+          cp "${{ matrix.bin_path }}" "$STAGE_DIR/${{ matrix.bin_name }}"
+          cp README.md "$STAGE_DIR/README.md"
+          cp docs/AETHER_GUIDE.md "$STAGE_DIR/AETHER_GUIDE.md"
+          cp tools/air "$STAGE_DIR/air" 2>/dev/null || true
+          cp tools/aetherpkg "$STAGE_DIR/aetherpkg" 2>/dev/null || true
+          cp tools/air.ps1 "$STAGE_DIR/air.ps1" 2>/dev/null || true
+          cp tools/aetherpkg.ps1 "$STAGE_DIR/aetherpkg.ps1" 2>/dev/null || true
+          cp scripts/install.sh "$STAGE_DIR/install.sh" 2>/dev/null || true
+          cp scripts/install.ps1 "$STAGE_DIR/install.ps1" 2>/dev/null || true
+
+      - name: Package tar.gz
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="aether-${VERSION}-${{ matrix.target }}"
+          tar -czf "dist/${NAME}.tar.gz" -C dist "$NAME"
+
+      - name: Package zip
+        if: matrix.archive_ext == 'zip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="aether-${VERSION}-${{ matrix.target }}"
+          cd dist
+          zip -r "${NAME}.zip" "$NAME"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aether-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: package
+    steps:
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
+          files: |
+            dist/*
+          generate_release_notes: true
