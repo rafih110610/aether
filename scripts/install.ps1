@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -eq "AMD64") {
@@ -13,7 +14,7 @@ if ($arch -eq "AMD64") {
 }
 
 $api = "https://api.github.com/repos/$Repo/releases/latest"
-$release = Invoke-RestMethod -Uri $api
+$release = Invoke-RestMethod -Uri $api -TimeoutSec 60
 $asset = $release.assets | Where-Object { $_.name -like "*-$target.zip" } | Select-Object -First 1
 
 if (-not $asset) {
@@ -24,7 +25,7 @@ $tmp = Join-Path $env:TEMP "aether-install-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
 $zipPath = Join-Path $tmp "aether.zip"
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -TimeoutSec 120
 Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 
 $exe = Get-ChildItem -Path $tmp -Recurse -Filter "aether.exe" | Select-Object -First 1

@@ -17,6 +17,9 @@ fi
 
 REPO="${1:-$DEFAULT_REPO}"
 
+# Keep network calls bounded so installs fail fast instead of hanging.
+CURL_OPTS=(--fail --silent --show-error --location --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2)
+
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 
@@ -41,7 +44,7 @@ esac
 TARGET="${ARCH_PART}-${OS_PART}"
 
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-DOWNLOAD_URL="$(curl -fsSL "$API_URL" | grep -oE "https://[^"]*aether-v[^"]*-${TARGET}\\.tar\\.gz" | head -n1)"
+DOWNLOAD_URL="$(curl "${CURL_OPTS[@]}" "$API_URL" | grep -oE "https://[^"]*aether-v[^"]*-${TARGET}\\.tar\\.gz" | head -n1)"
 
 if [[ -z "$DOWNLOAD_URL" ]]; then
   echo "Could not find release asset for target: $TARGET" >&2
@@ -52,7 +55,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 ARCHIVE_PATH="$TMP_DIR/aether.tar.gz"
-curl -fL "$DOWNLOAD_URL" -o "$ARCHIVE_PATH"
+curl "${CURL_OPTS[@]}" "$DOWNLOAD_URL" -o "$ARCHIVE_PATH"
 
 tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
 BIN_PATH="$(find "$TMP_DIR" -type f -name aether | head -n1)"
@@ -62,12 +65,31 @@ if [[ -z "$BIN_PATH" ]]; then
   exit 1
 fi
 
+AIR_PATH="$(find "$TMP_DIR" -type f -name air | head -n1 || true)"
+AETHERPKG_PATH="$(find "$TMP_DIR" -type f -name aetherpkg | head -n1 || true)"
+
 INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "$INSTALL_DIR"
 cp "$BIN_PATH" "$INSTALL_DIR/aether"
 chmod +x "$INSTALL_DIR/aether"
 
+if [[ -n "$AIR_PATH" ]]; then
+  cp "$AIR_PATH" "$INSTALL_DIR/air"
+  chmod +x "$INSTALL_DIR/air"
+fi
+
+if [[ -n "$AETHERPKG_PATH" ]]; then
+  cp "$AETHERPKG_PATH" "$INSTALL_DIR/aetherpkg"
+  chmod +x "$INSTALL_DIR/aetherpkg"
+fi
+
 echo "Installed Aether to: $INSTALL_DIR/aether"
+if [[ -n "$AIR_PATH" ]]; then
+  echo "Installed AIR to: $INSTALL_DIR/air"
+fi
+if [[ -n "$AETHERPKG_PATH" ]]; then
+  echo "Installed aetherpkg to: $INSTALL_DIR/aetherpkg"
+fi
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
   echo "Add $INSTALL_DIR to PATH to run 'aether' globally."
 fi
