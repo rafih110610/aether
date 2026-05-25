@@ -18,6 +18,17 @@ bash scripts/install.sh
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
+
+## Immediate Linux Install (no Release required yet)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rafih110610/aether/main/bin/linux-x86_64/aether -o ~/.local/bin/aether
+chmod +x ~/.local/bin/aether
+aether --help
+```
+
+This lets friends start right away while you prepare formal GitHub Release artifacts.
+
 ## Included tools
 
 - `aether` runtime (release assets and starter Linux binary)
