@@ -44,7 +44,7 @@ esac
 TARGET="${ARCH_PART}-${OS_PART}"
 
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-DOWNLOAD_URL="$(curl "${CURL_OPTS[@]}" "$API_URL" | grep -oE "https://[^"]*aether-v[^"]*-${TARGET}\\.tar\\.gz" | head -n1)"
+DOWNLOAD_URL="$(curl "${CURL_OPTS[@]}" "$API_URL" | grep -oE "https://[^\"]*aether-v[^\"]*-${TARGET}\\.tar\\.gz" | head -n1)"
 
 if [[ -z "$DOWNLOAD_URL" ]]; then
   echo "Could not find release asset for target: $TARGET" >&2
