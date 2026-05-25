@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_INDEX_DEFAULT="${SCRIPT_DIR}/packages/index.txt"
+INDEX_FALLBACK_URL="https://raw.githubusercontent.com/aether-lang/packages/main/index.txt"
+USER_AETHER_HOME="${HOME}/.local/share/aether"
+USER_SITE_PACKAGES="${USER_AETHER_HOME}/site-packages"
+USER_LOCKFILE="${USER_AETHER_HOME}/packages.lock"
+
+PACKAGES_DIR="aether_packages"
+LOCK_FILE="aether.lock"
+UPDATE_DEPENDENCIES="1"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  aetherpkg init
+  aetherpkg install [--local|--global] <name> [source]
+  aetherpkg add <name> [source]
+  aetherpkg uninstall [--local|--global] <name>
+  aetherpkg update [--local|--global] [name]
+  aetherpkg search <query>
+  aetherpkg index
+  aetherpkg list [--local|--global]
+
+Examples:
+  aetherpkg init
+  aetherpkg install --local colors ./packages/colors.ath
+  aetherpkg install colors            # auto: local if project, otherwise global
+  aetherpkg install --global colors
+  aetherpkg install web https://example.com/web.ath
+  aetherpkg search color
+  aetherpkg index
+  aetherpkg uninstall colors
+
+Env:
+  AETHERPKG_INDEX   Override index URL/path (defaults to hosted index)
+  AETHERPKG_CONNECT_TIMEOUT  Seconds for connection timeout (default: 5)
+  AETHERPKG_MAX_TIME         Max seconds per HTTP fetch (default: 15)
+EOF
+}
+
+set_scope() {
+  local mode="$1"
+  case "$mode" in
+    local)
+      PACKAGES_DIR="aether_packages"
+      LOCK_FILE="aether.lock"
+      UPDATE_DEPENDENCIES="1"
+      ;;
+    global)
+      PACKAGES_DIR="$USER_SITE_PACKAGES"
+      LOCK_FILE="$USER_LOCKFILE"
+      UPDATE_DEPENDENCIES="0"
+      ;;
+    *)
+      echo "Invalid scope mode: $mode" >&2
+      exit 1
+      ;;
+  esac
+}
+
+resolve_scope_mode() {
+  local requested="$1"
+  if [[ "$requested" == "local" || "$requested" == "global" ]]; then
+    printf "%s" "$requested"
+    return
+  fi
+  if [[ -f aether.toml ]]; then
+    printf "local"
+  else
+    printf "global"
+  fi
+}
+
+parse_scope_flag() {
+  local default_mode="$1"
+  shift
+
+  local mode="$default_mode"
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      --local)
+        mode="local"
+        shift
+        ;;
+      --global)
+        mode="global"
+        shift
+        ;;
+    esac
+  fi
+
+  PARSED_SCOPE="$mode"
+  PARSED_ARGS=("$@")
+}
+
+ensure_scope_ready() {
+  if [[ "$UPDATE_DEPENDENCIES" == "1" ]]; then
+    if [[ ! -f aether.toml ]]; then
+      echo "Missing aether.toml for local install. Run: aetherpkg init" >&2
+      echo "Or install globally: aetherpkg install --global <name>" >&2
+      exit 1
+    fi
+  fi
+
+  mkdir -p "$PACKAGES_DIR"
+  if [[ ! -f "$LOCK_FILE" ]]; then
+    printf "lockfile_version=1\n" > "$LOCK_FILE"
+  fi
+}
+
+index_source() {
+  if [[ -n "${AETHERPKG_INDEX:-}" ]]; then
+    printf "%s" "$AETHERPKG_INDEX"
+    return
+  fi
+
+  if [[ -f "$LOCAL_INDEX_DEFAULT" ]]; then
+    printf "%s" "$LOCAL_INDEX_DEFAULT"
+    return
+  fi
+
+  printf "%s" "$INDEX_FALLBACK_URL"
+}
+
+resolve_index_to_file() {
+  local idx="$1"
+  local tmp
+  tmp="$(mktemp)"
+  local connect_timeout="${AETHERPKG_CONNECT_TIMEOUT:-5}"
+  local max_time="${AETHERPKG_MAX_TIME:-15}"
+
+  if [[ "$idx" =~ ^https?:// ]]; then
+    if ! curl -fsSL \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      --retry 2 \
+      --retry-delay 1 \
+      "$idx" -o "$tmp"; then
+      rm -f "$tmp"
+      echo "Failed to fetch package index: $idx" >&2
+      echo "Tip: verify URL with 'air registry show' or increase timeout via AETHERPKG_MAX_TIME" >&2
+      exit 1
+    fi
+  else
+    if [[ ! -f "$idx" ]]; then
+      rm -f "$tmp"
+      echo "Package index file not found: $idx" >&2
+      exit 1
+    fi
+    cp "$idx" "$tmp"
+  fi
+
+  echo "$tmp"
+}
+
+resolve_from_index() {
+  local name="$1"
+  local idx
+  idx="$(index_source)"
+
+  local idx_file
+  idx_file="$(resolve_index_to_file "$idx")"
+
+  local line
+  line="$(awk -F'|' -v pkg="$name" '
+    /^[[:space:]]*#/ { next }
+    NF >= 2 {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      if ($1 == pkg) { print $0; exit }
+    }
+  ' "$idx_file")"
+
+  if [[ -z "$line" ]]; then
+    rm -f "$idx_file"
+    echo "Package '$name' not found in index: $idx" >&2
+    echo "Tip: set AETHERPKG_INDEX to your own index file or URL." >&2
+    exit 1
+  fi
+
+  local src
+  src="$(printf "%s" "$line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')"
+
+  if [[ "$idx" =~ ^https?:// && ! "$src" =~ ^https?:// ]]; then
+    local base
+    base="${idx%/*}"
+    src="${src#./}"
+    src="${base}/${src}"
+  elif [[ ! "$idx" =~ ^https?:// && ! "$src" =~ ^https?:// && "$src" != /* ]]; then
+    local idx_dir
+    idx_dir="$(cd "$(dirname "$idx")" && pwd)"
+    src="${src#./}"
+    src="${idx_dir}/${src}"
+  fi
+
+  rm -f "$idx_file"
+  printf "%s" "$src"
+}
+
+upsert_dependency() {
+  local name="$1"
+  local source="$2"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -v dep="$name" -v src="$source" '
+    BEGIN { in_deps=0; deps_seen=0; written=0 }
+    {
+      if ($0 ~ /^\[dependencies\][[:space:]]*$/) {
+        deps_seen=1
+        in_deps=1
+        print
+        next
+      }
+
+      if (in_deps && $0 ~ /^\[/) {
+        if (!written) {
+          printf "%s = \"%s\"\n", dep, src
+          written=1
+        }
+        in_deps=0
+      }
+
+      if (in_deps && $0 ~ "^[[:space:]]*" dep "[[:space:]]*=") {
+        if (!written) {
+          printf "%s = \"%s\"\n", dep, src
+          written=1
+        }
+        next
+      }
+
+      print
+    }
+    END {
+      if (!deps_seen) {
+        print ""
+        print "[dependencies]"
+      }
+      if (!written) {
+        printf "%s = \"%s\"\n", dep, src
+      }
+    }
+  ' aether.toml > "$tmp"
+
+  mv "$tmp" aether.toml
+}
+
+remove_dependency() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -v dep="$name" '
+    BEGIN { in_deps=0 }
+    {
+      if ($0 ~ /^\[dependencies\][[:space:]]*$/) {
+        in_deps=1
+        print
+        next
+      }
+      if (in_deps && $0 ~ /^\[/) {
+        in_deps=0
+      }
+      if (in_deps && $0 ~ "^[[:space:]]*" dep "[[:space:]]*=") {
+        next
+      }
+      print
+    }
+  ' aether.toml > "$tmp"
+
+  mv "$tmp" aether.toml
+}
+
+write_lock_entry() {
+  local name="$1"
+  local source="$2"
+  local checksum="$3"
+  local file="$4"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  # Keep header and remove existing entry for this package name.
+  awk -F'|' -v pkg="$name" '
+    BEGIN { OFS="|" }
+    /^lockfile_version=/ { print; next }
+    NF == 0 { next }
+    $1 != pkg { print }
+  ' "$LOCK_FILE" > "$tmp"
+
+  printf "%s|%s|%s|%s\n" "$name" "$source" "$checksum" "$file" >> "$tmp"
+  mv "$tmp" "$LOCK_FILE"
+}
+
+remove_lock_entry() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -F'|' -v pkg="$name" '
+    /^lockfile_version=/ { print; next }
+    NF == 0 { next }
+    $1 != pkg { print }
+  ' "$LOCK_FILE" > "$tmp"
+
+  mv "$tmp" "$LOCK_FILE"
+}
+
+install_from_source() {
+  local name="$1"
+  local source="$2"
+
+  if [[ ! "$name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+    echo "Invalid package name: $name" >&2
+    exit 1
+  fi
+
+  local target="${PACKAGES_DIR}/${name}.ath"
+  if [[ "$source" =~ ^https?:// ]]; then
+    curl -fsSL "$source" -o "$target"
+  else
+    if [[ ! -f "$source" ]]; then
+      echo "Source file not found: $source" >&2
+      exit 1
+    fi
+    cp "$source" "$target"
+  fi
+
+  local checksum
+  checksum="$(sha256sum "$target" | awk '{print $1}')"
+
+  write_lock_entry "$name" "$source" "$checksum" "$target"
+  if [[ "$UPDATE_DEPENDENCIES" == "1" ]]; then
+    upsert_dependency "$name" "$source"
+  fi
+
+  echo "Installed $name -> $target"
+  echo "Source: $source"
+  echo "Checksum: $checksum"
+}
+
+cmd_init() {
+  if [[ -f aether.toml ]]; then
+    echo "aether.toml already exists"
+  else
+    cat > aether.toml <<'EOF'
+name = "my-aether-project"
+version = "0.1.0"
+aether = ">=0.1.0"
+
+[dependencies]
+EOF
+    echo "Created aether.toml"
+  fi
+
+  if [[ -f aether.lock ]]; then
+    echo "aether.lock already exists"
+  else
+    printf "lockfile_version=1\n" > aether.lock
+    echo "Created aether.lock"
+  fi
+
+  mkdir -p aether_packages
+}
+
+cmd_install() {
+  parse_scope_flag "auto" "$@"
+  set -- "${PARSED_ARGS[@]}"
+
+  if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage
+    exit 2
+  fi
+
+  local mode
+  mode="$(resolve_scope_mode "$PARSED_SCOPE")"
+  set_scope "$mode"
+  ensure_scope_ready
+
+  local name="$1"
+
+  local source
+  if [[ $# -eq 2 ]]; then
+    source="$2"
+  else
+    source="$(resolve_from_index "$name")"
+  fi
+
+  install_from_source "$name" "$source"
+}
+
+cmd_uninstall() {
+  parse_scope_flag "auto" "$@"
+  set -- "${PARSED_ARGS[@]}"
+
+  if [[ $# -ne 1 ]]; then
+    usage
+    exit 2
+  fi
+
+  local mode
+  mode="$(resolve_scope_mode "$PARSED_SCOPE")"
+  set_scope "$mode"
+  ensure_scope_ready
+
+  local name="$1"
+  local target="${PACKAGES_DIR}/${name}.ath"
+  if [[ -f "$target" ]]; then
+    rm -f "$target"
+  fi
+
+  remove_lock_entry "$name"
+  if [[ "$UPDATE_DEPENDENCIES" == "1" ]]; then
+    remove_dependency "$name"
+  fi
+  echo "Uninstalled $name"
+}
+
+cmd_update() {
+  parse_scope_flag "auto" "$@"
+  set -- "${PARSED_ARGS[@]}"
+
+  local mode
+  mode="$(resolve_scope_mode "$PARSED_SCOPE")"
+  set_scope "$mode"
+  ensure_scope_ready
+
+  if [[ $# -eq 1 ]]; then
+    local name="$1"
+    local source
+    source="$(awk -F'|' -v pkg="$name" '$1==pkg {print $2; exit}' "$LOCK_FILE")"
+    if [[ -z "$source" ]]; then
+      echo "Package '$name' is not installed" >&2
+      exit 1
+    fi
+    install_from_source "$name" "$source"
+    return
+  fi
+
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 2
+  fi
+
+  local lines
+  lines="$(awk -F'|' 'NF==4 {print $1"|"$2}' "$LOCK_FILE")"
+  if [[ -z "$lines" ]]; then
+    echo "No installed packages to update"
+    return
+  fi
+
+  while IFS='|' read -r name source; do
+    [[ -z "$name" ]] && continue
+    install_from_source "$name" "$source"
+  done <<< "$lines"
+}
+
+cmd_search() {
+  if [[ $# -ne 1 ]]; then
+    usage
+    exit 2
+  fi
+
+  local query="$1"
+  local idx
+  idx="$(index_source)"
+  local idx_file
+  idx_file="$(resolve_index_to_file "$idx")"
+
+  local results
+  results="$(awk -F'|' -v q="$query" '
+    BEGIN { IGNORECASE=1 }
+    /^[[:space:]]*#/ { next }
+    NF >= 2 {
+      name=$1; src=$2; desc=""
+      if (NF >= 3) { desc=$3 }
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", src)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", desc)
+      line=tolower(name " " src " " desc)
+      if (index(line, tolower(q)) > 0) {
+        printf "%-18s %-45s %s\n", name, src, desc
+      }
+    }
+  ' "$idx_file")"
+
+  if [[ -n "$results" ]]; then
+    printf "%s\n" "$results"
+  else
+    echo "No packages found for query: $query"
+  fi
+
+  rm -f "$idx_file"
+}
+
+cmd_index() {
+  echo "Aether package index: $(index_source)"
+}
+
+cmd_list() {
+  parse_scope_flag "auto" "$@"
+  set -- "${PARSED_ARGS[@]}"
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 2
+  fi
+
+  local mode
+  mode="$(resolve_scope_mode "$PARSED_SCOPE")"
+  set_scope "$mode"
+
+  if [[ ! -f "$LOCK_FILE" ]]; then
+    echo "No lockfile found"
+    exit 0
+  fi
+  awk -F'|' '
+    /^lockfile_version=/ { next }
+    NF == 4 {
+      printf "%-20s %-50s %s\n", $1, $4, $3
+    }
+  ' "$LOCK_FILE"
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 2
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    add) cmd_install "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall|remove|rm) cmd_uninstall "$@" ;;
+    update|upgrade) cmd_update "$@" ;;
+    search|find) cmd_search "$@" ;;
+    index) cmd_index ;;
+    list) cmd_list "$@" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
